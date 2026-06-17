@@ -1,15 +1,27 @@
 import Leave from '../models/Leave.js';
 import LeaveBalance from '../models/LeaveBalance.js';
 import Student from '../models/Student.js';
+import Teacher from '../models/Teacher.js';
 import User from '../models/User.js';
+import { sendSuccess, sendError } from '../utils/response.js';
+import { getPagination, getPaginationMeta } from '../utils/pagination.js';
+import AppError from '../utils/AppError.js';
 
-export const getLeaves = async (req, res) => {
+export const getLeaves = async (req, res, next) => {
   const { studentEmail } = req.query;
 
   try {
+    const { page: p, limit: l } = getPagination(req.query);
     let query = {};
 
-    if (studentEmail) {
+    if (req.user.role === 'teacher') {
+      const teacher = await Teacher.findOne({ user: req.user._id });
+      if (teacher && teacher.classTeacherOf) {
+        const students = await Student.find({ class: teacher.classTeacherOf }).select('_id');
+        const studentIds = students.map(s => s._id);
+        query.student = { $in: studentIds };
+      }
+    } else if (studentEmail) {
       const user = await User.findOne({ email: studentEmail });
       if (user) {
         const student = await Student.findOne({ user: user._id });
@@ -19,11 +31,14 @@ export const getLeaves = async (req, res) => {
       }
     }
 
+    const total = await Leave.countDocuments(query);
     const leaveRequests = await Leave.find(query)
       .populate('student')
+      .skip(p.skip)
+      .limit(l)
       .sort({ createdAt: -1 });
 
-    const formatted = leaveRequests.map(l => ({
+    const formatted = leaveRequests.map((l) => ({
       id: l._id,
       name: l.name,
       rollNo: l.rollNo,
@@ -33,23 +48,25 @@ export const getLeaves = async (req, res) => {
       to: l.to.toISOString().split('T')[0],
       status: l.status,
       grade: l.grade,
-      reason: l.reason
+      reason: l.reason,
     }));
 
-    res.json(formatted);
+    return sendSuccess(res, {
+      leaves: formatted,
+      pagination: getPaginationMeta(total, p.page, l.limit),
+    });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error fetching leaves', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const createLeave = async (req, res) => {
+export const createLeave = async (req, res, next) => {
   const { studentEmail, type, from, to, reason } = req.body;
 
   try {
     const user = await User.findOne({ email: studentEmail });
     if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+      return sendError(res, 'User not found', 404);
     }
 
     const student = await Student.findOne({ user: user._id }).populate('class');
@@ -64,29 +81,18 @@ export const createLeave = async (req, res) => {
       applicantType: 'student',
       name: user.name,
       rollNo: student ? student.rollNo : 'N/A',
-      grade: student && student.class ? `${student.class.name}-${student.class.section}` : (student ? student.grade : 'General'),
+      grade: student && student.class
+        ? `${student.class.name}-${student.class.section}`
+        : (student ? student.grade : 'General'),
       type,
       from: fromDate,
       to: toDate,
       days,
       reason,
-      status: 'Pending'
+      status: 'Pending',
     });
 
-    // Deduct leave balance if any
-    const balance = await LeaveBalance.findOne({ user: user._id });
-    if (balance) {
-      if (type === 'Sick' || type === 'Medical') {
-        balance.sickLeave.used += days;
-      } else if (type === 'Casual') {
-        balance.casualLeave.used += days;
-      } else {
-        balance.annualLeave.used += days;
-      }
-      await balance.save();
-    }
-
-    res.status(201).json({
+    return sendSuccess(res, {
       id: leave._id,
       name: leave.name,
       rollNo: leave.rollNo,
@@ -96,59 +102,73 @@ export const createLeave = async (req, res) => {
       to: leave.to.toISOString().split('T')[0],
       status: leave.status,
       grade: leave.grade,
-      reason: leave.reason
-    });
+      reason: leave.reason,
+    }, 'Leave request created successfully', 201);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error creating leave', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const updateLeave = async (req, res) => {
+export const updateLeave = async (req, res, next) => {
   const { id } = req.params;
   const { status, remarks } = req.body;
 
   try {
-    const leave = await Leave.findById(id);
+    const leave = await Leave.findById(id).populate('student');
     if (!leave) {
-      return res.status(404).json({ message: 'Leave request not found' });
+      return sendError(res, 'Leave request not found', 404);
     }
 
+    const previousStatus = leave.status;
     if (status) leave.status = status;
     if (remarks) leave.remarks = remarks;
 
     await leave.save();
 
-    res.json({ message: 'Leave request updated successfully', leave });
+    if (status === 'Approved' && previousStatus !== 'Approved' && leave.student) {
+      const student = await Student.findById(leave.student._id || leave.student);
+      if (student) {
+        const balance = await LeaveBalance.findOne({ user: student.user });
+        if (balance) {
+          if (leave.type === 'Sick' || leave.type === 'Medical') {
+            balance.sickLeave.used += leave.days;
+          } else if (leave.type === 'Casual') {
+            balance.casualLeave.used += leave.days;
+          } else {
+            balance.annualLeave.used += leave.days;
+          }
+          await balance.save();
+        }
+      }
+    }
+
+    return sendSuccess(res, { leave }, 'Leave request updated successfully');
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error updating leave', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const getLeaveBalance = async (req, res) => {
+export const getLeaveBalance = async (req, res, next) => {
   const { email } = req.query;
 
   try {
     const user = await User.findOne({ email });
     if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+      return sendError(res, 'User not found', 404);
     }
 
     let balance = await LeaveBalance.findOne({ user: user._id });
     if (!balance) {
-      // Create a default balance
       balance = await LeaveBalance.create({
         user: user._id,
         annualLeave: { total: 20, used: 0 },
         sickLeave: { total: 12, used: 0 },
-        casualLeave: { total: 10, used: 0 }
+        casualLeave: { total: 10, used: 0 },
       });
     }
 
-    res.json(balance);
+    return sendSuccess(res, balance);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error fetching leave balance', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };

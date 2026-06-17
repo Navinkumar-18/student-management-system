@@ -4,14 +4,24 @@ import Subject from '../models/Subject.js';
 import Teacher from '../models/Teacher.js';
 import Class from '../models/Class.js';
 import User from '../models/User.js';
+import { sendSuccess, sendError } from '../utils/response.js';
+import { getPagination, getPaginationMeta } from '../utils/pagination.js';
+import AppError from '../utils/AppError.js';
 
-export const getHomework = async (req, res) => {
+export const getHomework = async (req, res, next) => {
   const { studentEmail, className } = req.query;
 
   try {
+    const { page: p, limit: l } = getPagination(req.query);
+
     let query = {};
 
-    if (studentEmail) {
+    if (req.user.role === 'teacher') {
+      const teacher = await Teacher.findOne({ user: req.user._id });
+      if (teacher && teacher.classTeacherOf) {
+        query.class = teacher.classTeacherOf;
+      }
+    } else if (studentEmail) {
       const user = await User.findOne({ email: studentEmail });
       if (user) {
         const student = await Student.findOne({ user: user._id });
@@ -29,20 +39,23 @@ export const getHomework = async (req, res) => {
       }
     }
 
+    const total = await Homework.countDocuments(query);
     const homeworkList = await Homework.find(query)
       .populate('subject', 'name code')
       .populate({
         path: 'teacher',
-        populate: { path: 'user', select: 'name' }
+        populate: { path: 'user', select: 'name' },
       })
       .populate('class', 'name section')
       .populate({
         path: 'submittedBy.student',
-        populate: { path: 'user', select: 'name' }
+        populate: { path: 'user', select: 'name' },
       })
+      .skip(p.skip)
+      .limit(l)
       .sort({ dueDate: 1 });
 
-    const formatted = homeworkList.map(hw => ({
+    const formatted = homeworkList.map((hw) => ({
       id: hw._id,
       title: hw.title,
       subject: hw.subject?.name || 'General',
@@ -52,51 +65,68 @@ export const getHomework = async (req, res) => {
       submissions: hw.submissions,
       total: hw.totalStudents,
       status: hw.status,
-      submissionsList: hw.submittedBy.map(sub => ({
+      submissionsList: hw.submittedBy.map((sub) => ({
         studentId: sub.student?._id || sub.student,
         studentName: sub.student?.user?.name || 'Student',
         text: sub.text,
         fileUrl: sub.fileUrl,
         fileName: sub.fileName,
         status: sub.status || 'Pending',
-        submittedAt: sub.submittedAt
-      }))
+        submittedAt: sub.submittedAt,
+      })),
     }));
 
-    res.json(formatted);
+    return sendSuccess(res, {
+      homework: formatted,
+      pagination: getPaginationMeta(total, p.page, l.limit),
+    });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error fetching homework', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const createHomework = async (req, res) => {
+export const createHomework = async (req, res, next) => {
   const { title, subject, description, dueDate, className } = req.body;
 
   try {
-    // Let's resolve class
-    const gradeParts = (className || '10-A').split('-');
-    const clsName = gradeParts[0] || '10';
-    const clsSec = gradeParts[1] || 'A';
-    let studentClass = await Class.findOne({ name: clsName, section: clsSec });
-    if (!studentClass) {
-      studentClass = await Class.create({ name: clsName, section: clsSec, grade: clsName });
+    if (!title || !subject || !dueDate) {
+      return sendError(res, 'Title, subject and due date are required', 400);
     }
 
-    // Resolve subject
+    let studentClass;
+    if (req.user.role === 'teacher') {
+      const teacher = await Teacher.findOne({ user: req.user._id });
+      if (teacher && teacher.classTeacherOf) {
+        studentClass = await Class.findById(teacher.classTeacherOf);
+      }
+    }
+    if (!studentClass) {
+      const gradeParts = (className || '10-A').split('-');
+      const clsName = gradeParts[0] || '10';
+      const clsSec = gradeParts[1] || 'A';
+      studentClass = await Class.findOne({ name: clsName, section: clsSec });
+      if (!studentClass) {
+        studentClass = await Class.create({ name: clsName, section: clsSec, grade: clsName });
+      }
+    }
+
     let subj = await Subject.findOne({ name: subject });
     if (!subj) {
       const uniqueCode = subject.substring(0, 3).toUpperCase() + Math.floor(10 + Math.random() * 90);
       subj = await Subject.create({ name: subject, code: uniqueCode });
     }
 
-    // Assign a default teacher
-    const teacher = await Teacher.findOne({});
+    let teacher;
+    if (req.user && req.user.role === 'teacher') {
+      teacher = await Teacher.findOne({ user: req.user._id });
+    }
     if (!teacher) {
-      return res.status(400).json({ message: 'No teacher profiles available to assign homework' });
+      teacher = await Teacher.findOne({});
+    }
+    if (!teacher) {
+      return sendError(res, 'No teacher profiles available to assign homework', 400);
     }
 
-    // Count students in this class
     const totalStudents = await Student.countDocuments({ class: studentClass._id });
 
     const homework = await Homework.create({
@@ -108,34 +138,33 @@ export const createHomework = async (req, res) => {
       dueDate: new Date(dueDate),
       totalStudents: totalStudents || 20,
       submissions: 0,
-      status: 'Active'
+      status: 'Active',
     });
 
-    res.status(201).json({
+    return sendSuccess(res, {
       id: homework._id,
       title: homework.title,
-      subject: subject,
+      subject,
       teacher: 'Admin',
       description: homework.description,
       dueDate: homework.dueDate.toISOString().split('T')[0],
       submissions: homework.submissions,
       total: homework.totalStudents,
-      status: homework.status
-    });
+      status: homework.status,
+    }, 'Homework created successfully', 201);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error creating homework', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const updateHomework = async (req, res) => {
+export const updateHomework = async (req, res, next) => {
   const { id } = req.params;
   const { status, title, description, dueDate } = req.body;
 
   try {
     const hw = await Homework.findById(id);
     if (!hw) {
-      return res.status(404).json({ message: 'Homework not found' });
+      return sendError(res, 'Homework not found', 404);
     }
 
     if (status) hw.status = status;
@@ -145,15 +174,14 @@ export const updateHomework = async (req, res) => {
 
     await hw.save();
 
-    // Populate for response
     const updated = await Homework.findById(id)
       .populate('subject', 'name')
       .populate({
         path: 'teacher',
-        populate: { path: 'user', select: 'name' }
+        populate: { path: 'user', select: 'name' },
       });
 
-    res.json({
+    return sendSuccess(res, {
       id: updated._id,
       title: updated.title,
       subject: updated.subject?.name || 'General',
@@ -162,35 +190,36 @@ export const updateHomework = async (req, res) => {
       dueDate: updated.dueDate.toISOString().split('T')[0],
       submissions: updated.submissions,
       total: updated.totalStudents,
-      status: updated.status
-    });
+      status: updated.status,
+    }, 'Homework updated successfully');
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error updating homework', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const submitHomework = async (req, res) => {
+export const submitHomework = async (req, res, next) => {
   const { id } = req.params;
   const { studentEmail, text } = req.body;
-  const fileUrl = req.file ? `/uploads/homework/${req.file.filename}` : '';
-  const fileName = req.file ? req.file.originalname : '';
 
   try {
     const hw = await Homework.findById(id);
     if (!hw) {
-      return res.status(404).json({ message: 'Homework not found' });
+      return sendError(res, 'Homework not found', 404);
     }
 
     const user = await User.findOne({ email: studentEmail });
-    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user) return sendError(res, 'User not found', 404);
 
     const student = await Student.findOne({ user: user._id });
-    if (!student) return res.status(404).json({ message: 'Student not found' });
+    if (!student) return sendError(res, 'Student not found', 404);
 
-    // Check if already submitted
-    const existingSubmissionIndex = hw.submittedBy.findIndex(s => s.student.toString() === student._id.toString());
-    
+    const existingSubmissionIndex = hw.submittedBy.findIndex(
+      (s) => s.student.toString() === student._id.toString()
+    );
+
+    const fileUrl = req.file ? `/uploads/homework/${req.file.filename}` : '';
+    const fileName = req.file ? req.file.originalname : '';
+
     if (existingSubmissionIndex >= 0) {
       hw.submittedBy[existingSubmissionIndex].text = text;
       if (fileUrl) {
@@ -204,44 +233,39 @@ export const submitHomework = async (req, res) => {
         text,
         fileUrl,
         fileName,
-        submittedAt: new Date()
+        submittedAt: new Date(),
       });
       hw.submissions += 1;
     }
 
-    // Mark status as Grading if it was Active (just as a global indicator, though status is global for the whole class usually)
-    // Actually hw.status is global, so we shouldn't change it to Grading unless dueDate passed. We will leave hw.status intact.
-
     await hw.save();
 
-    res.json({ message: 'Homework submitted successfully', fileUrl, fileName });
+    return sendSuccess(res, { fileUrl, fileName }, 'Homework submitted successfully');
   } catch (error) {
-    console.error('Error submitting homework:', error);
-    res.status(500).json({ message: 'Server Error submitting homework', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const verifySubmission = async (req, res) => {
+export const verifySubmission = async (req, res, next) => {
   const { id } = req.params;
   const { studentId, status } = req.body;
 
   try {
     const hw = await Homework.findById(id);
     if (!hw) {
-      return res.status(404).json({ message: 'Homework not found' });
+      return sendError(res, 'Homework not found', 404);
     }
 
-    const sub = hw.submittedBy.find(s => s.student.toString() === studentId);
+    const sub = hw.submittedBy.find((s) => s.student.toString() === studentId);
     if (!sub) {
-      return res.status(404).json({ message: 'Submission not found for this student' });
+      return sendError(res, 'Submission not found for this student', 404);
     }
 
     sub.status = status;
     await hw.save();
 
-    res.json({ message: 'Submission status updated successfully', status });
+    return sendSuccess(res, { status }, 'Submission status updated successfully');
   } catch (error) {
-    console.error('Error verifying submission:', error);
-    res.status(500).json({ message: 'Server Error verifying submission', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };

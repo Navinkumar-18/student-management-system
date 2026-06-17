@@ -2,52 +2,64 @@ import Teacher from '../models/Teacher.js';
 import User from '../models/User.js';
 import Class from '../models/Class.js';
 import Subject from '../models/Subject.js';
+import { isLoginAllowedEmail } from '../utils/emailValidation.js';
+import { sendSuccess, sendError } from '../utils/response.js';
+import { getPagination, getPaginationMeta } from '../utils/pagination.js';
+import AppError from '../utils/AppError.js';
 
-export const getTeachers = async (req, res) => {
+export const getTeachers = async (req, res, next) => {
   try {
+    const { page: p, limit: l } = getPagination(req.query);
+    const total = await Teacher.countDocuments({});
     const teachers = await Teacher.find({})
       .populate('user', 'name email avatar')
       .populate('subjects', 'name code')
-      .populate('classTeacherOf', 'name section');
+      .populate('classTeacherOf', 'name section')
+      .skip(p.skip)
+      .limit(l)
+      .sort({ createdAt: -1 });
 
-    const formatted = teachers.map(t => ({
+    const formatted = teachers.map((t) => ({
       id: t._id,
       name: t.user?.name || 'Unknown',
       email: t.user?.email || 'N/A',
       employeeId: t.employeeId,
-      subjects: t.subjects.map(s => s.name),
+      subjects: t.subjects.map((s) => s.name),
       classTeacherOf: t.classTeacherOf ? `${t.classTeacherOf.name}-${t.classTeacherOf.section}` : 'None',
       phone: t.phone,
       qualification: t.qualification,
       dateOfJoining: t.dateOfJoining ? new Date(t.dateOfJoining).toISOString().split('T')[0] : '',
       status: t.status,
-      avatar: t.user?.avatar || (t.user?.name ? t.user.name.substring(0, 2).toUpperCase() : 'NA')
+      avatar: t.user?.avatar || (t.user?.name ? t.user.name.substring(0, 2).toUpperCase() : 'NA'),
     }));
 
-    res.json(formatted);
+    return sendSuccess(res, {
+      teachers: formatted,
+      pagination: getPaginationMeta(total, p.page, l.limit),
+    });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error fetching teachers', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const createTeacher = async (req, res) => {
+export const createTeacher = async (req, res, next) => {
   const { name, email, password, employeeId, subjects, classTeacherOf, phone, qualification, status } = req.body;
 
   try {
-    // Check if user already exists
+    if (!isLoginAllowedEmail(email)) {
+      return sendError(res, 'Please enter a proper professional mail id ending with @gmail.com', 400);
+    }
+
     const userExists = await User.findOne({ email });
     if (userExists) {
-      return res.status(400).json({ message: 'User with this email already exists' });
+      return sendError(res, 'User with this email already exists', 400);
     }
 
-    // Check if employeeId is unique
     const empExists = await Teacher.findOne({ employeeId });
     if (empExists) {
-      return res.status(400).json({ message: 'Teacher with this Employee ID already exists' });
+      return sendError(res, 'Teacher with this Employee ID already exists', 400);
     }
 
-    // Resolve class
     let targetClass = null;
     if (classTeacherOf && classTeacherOf !== 'None') {
       const parts = classTeacherOf.split('-');
@@ -59,7 +71,6 @@ export const createTeacher = async (req, res) => {
       }
     }
 
-    // Resolve subjects
     const subjectIds = [];
     if (Array.isArray(subjects)) {
       for (const sName of subjects) {
@@ -71,15 +82,12 @@ export const createTeacher = async (req, res) => {
       }
     }
 
-    // Create User
     const user = await User.create({
-      name,
-      email,
-      password: password || 'password123', // default password
-      role: 'teacher'
+      name, email,
+      password: password || 'password123',
+      role: 'teacher',
     });
 
-    // Create Teacher Profile
     const teacher = await Teacher.create({
       user: user._id,
       employeeId,
@@ -88,10 +96,10 @@ export const createTeacher = async (req, res) => {
       phone: phone || '',
       qualification: qualification || '',
       dateOfJoining: new Date(),
-      status: status || 'Active'
+      status: status || 'Active',
     });
 
-    res.status(201).json({
+    return sendSuccess(res, {
       id: teacher._id,
       name: user.name,
       email: user.email,
@@ -100,28 +108,35 @@ export const createTeacher = async (req, res) => {
       classTeacherOf: classTeacherOf || 'None',
       phone: teacher.phone,
       qualification: teacher.qualification,
-      status: teacher.status
-    });
+      status: teacher.status,
+    }, 'Teacher created successfully', 201);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error creating teacher', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const updateTeacher = async (req, res) => {
+export const updateTeacher = async (req, res, next) => {
   const { id } = req.params;
   const { name, email, employeeId, subjects, classTeacherOf, phone, qualification, status } = req.body;
 
   try {
     const teacher = await Teacher.findById(id).populate('user');
     if (!teacher) {
-      return res.status(404).json({ message: 'Teacher profile not found' });
+      return sendError(res, 'Teacher profile not found', 404);
     }
 
-    // Update User details
     if (teacher.user) {
       if (name) teacher.user.name = name;
-      if (email) teacher.user.email = email;
+      if (email) {
+        if (!isLoginAllowedEmail(email)) {
+          return sendError(res, 'Please enter a proper professional mail id ending with @gmail.com', 400);
+        }
+        const emailOwner = await User.findOne({ email, _id: { $ne: teacher.user._id } });
+        if (emailOwner) {
+          return sendError(res, 'User with this email already exists', 400);
+        }
+        teacher.user.email = email;
+      }
       await teacher.user.save();
     }
 
@@ -130,7 +145,6 @@ export const updateTeacher = async (req, res) => {
     if (qualification !== undefined) teacher.qualification = qualification;
     if (status) teacher.status = status;
 
-    // Resolve class
     if (classTeacherOf) {
       if (classTeacherOf === 'None') {
         teacher.classTeacherOf = null;
@@ -146,7 +160,6 @@ export const updateTeacher = async (req, res) => {
       }
     }
 
-    // Resolve subjects
     if (Array.isArray(subjects)) {
       const subjectIds = [];
       for (const sName of subjects) {
@@ -161,7 +174,7 @@ export const updateTeacher = async (req, res) => {
 
     await teacher.save();
 
-    res.json({
+    return sendSuccess(res, {
       id: teacher._id,
       name: teacher.user?.name || name,
       email: teacher.user?.email || email,
@@ -170,33 +183,29 @@ export const updateTeacher = async (req, res) => {
       classTeacherOf: classTeacherOf || 'None',
       phone: teacher.phone,
       qualification: teacher.qualification,
-      status: teacher.status
-    });
+      status: teacher.status,
+    }, 'Teacher updated successfully');
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error updating teacher', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const deleteTeacher = async (req, res) => {
+export const deleteTeacher = async (req, res, next) => {
   const { id } = req.params;
 
   try {
     const teacher = await Teacher.findById(id);
     if (!teacher) {
-      return res.status(404).json({ message: 'Teacher profile not found' });
+      return sendError(res, 'Teacher profile not found', 404);
     }
 
-    // Delete base user record
     if (teacher.user) {
       await User.findByIdAndDelete(teacher.user);
     }
-
     await Teacher.findByIdAndDelete(id);
 
-    res.json({ message: 'Teacher deleted successfully' });
+    return sendSuccess(res, null, 'Teacher deleted successfully');
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error deleting teacher', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };

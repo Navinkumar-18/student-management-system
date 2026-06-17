@@ -4,74 +4,106 @@ import Student from '../models/Student.js';
 import Class from '../models/Class.js';
 import Fee from '../models/Fee.js';
 import jwt from 'jsonwebtoken';
+import { isLoginAllowedEmail } from '../utils/emailValidation.js';
+import { sendSuccess, sendError } from '../utils/response.js';
+import AppError from '../utils/AppError.js';
 
 const generateToken = (id, role) => {
-  return jwt.sign({ id, role }, process.env.JWT_SECRET || 'your_jwt_secret_key_change_in_production', {
+  return jwt.sign({ id, role }, process.env.JWT_SECRET, {
     expiresIn: '30d',
   });
 };
 
-export const authUser = async (req, res) => {
+export const authUser = async (req, res, next) => {
   const { email, password } = req.body;
 
-  // First, check if the email exists in the Admin table or matches admin@gmail.com
-  if (email === 'admin@gmail.com') {
-    const admin = await Admin.findOne({ email });
-    if (admin && (await admin.matchPassword(password))) {
-      return res.json({
-        _id: admin._id,
-        email: admin.email,
-        role: 'admin',
-        token: generateToken(admin._id, 'admin'),
-      });
-    } else {
-      return res.status(401).json({ message: 'Invalid email or password' });
+  try {
+    if (!isLoginAllowedEmail(email)) {
+      return sendError(res, 'Please enter a proper professional mail id ending with @gmail.com', 400);
     }
-  }
 
-  // If not admin, check in User table (for students/teachers)
-  const user = await User.findOne({ email }).select('+password');
+    const admin = await Admin.findOne({ email });
+    if (admin) {
+      if (await admin.matchPassword(password)) {
+        return sendSuccess(res, {
+          _id: admin._id,
+          email: admin.email,
+          role: 'admin',
+          token: generateToken(admin._id, 'admin'),
+        }, 'Login successful');
+      }
+      return sendError(res, 'Invalid email or password', 401);
+    }
 
-  if (user && (await user.matchPassword(password))) {
-    const userRole = user.role;
+    const user = await User.findOne({ email }).select('+password');
+    if (user && (await user.matchPassword(password))) {
+      return sendSuccess(res, {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar,
+        token: generateToken(user._id, user.role),
+      }, 'Login successful');
+    }
 
-    return res.json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      role: userRole,
-      avatar: user.avatar,
-      token: generateToken(user._id, userRole),
-    });
-  } else {
-    return res.status(401).json({ message: 'Invalid email or password' });
+    return sendError(res, 'Invalid email or password', 401);
+  } catch (error) {
+    next(new AppError(error.message, 500));
   }
 };
 
-export const registerUser = async (req, res) => {
+export const changePassword = async (req, res, next) => {
+  const { currentPassword, newPassword } = req.body;
+
+  try {
+    const admin = await Admin.findById(req.user._id);
+    if (admin) {
+      if (!(await admin.matchPassword(currentPassword))) {
+        return sendError(res, 'Current password is incorrect', 401);
+      }
+      admin.password = newPassword;
+      await admin.save();
+      return sendSuccess(res, null, 'Password updated successfully');
+    }
+
+    const user = await User.findById(req.user._id).select('+password');
+    if (!user) {
+      return sendError(res, 'User not found', 404);
+    }
+
+    if (!(await user.matchPassword(currentPassword))) {
+      return sendError(res, 'Current password is incorrect', 401);
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    return sendSuccess(res, null, 'Password updated successfully');
+  } catch (error) {
+    next(new AppError(error.message, 500));
+  }
+};
+
+export const registerUser = async (req, res, next) => {
   const { name, email, password } = req.body;
 
   try {
-    const userExists = await User.findOne({ email });
+    if (!isLoginAllowedEmail(email)) {
+      return sendError(res, 'Please enter a proper professional mail id ending with @gmail.com', 400);
+    }
 
+    const userExists = await User.findOne({ email });
     if (userExists) {
-      return res.status(400).json({ message: 'User already exists' });
+      return sendError(res, 'User already exists', 400);
     }
 
     if (email === 'admin@gmail.com') {
-      return res.status(400).json({ message: 'Email reserved for admin' });
+      return sendError(res, 'Email reserved for admin', 400);
     }
 
-    const role = 'student';
+    const user = await User.create({ name, email, password, role: 'student' });
 
-    const user = await User.create({
-      name,
-      email,
-      password,
-      role,
-    });
-
-    // Handle student creation directly so they show up across the application
     if (user.role === 'student') {
       let defaultClass = await Class.findOne({ name: 'General', section: 'A' });
       if (!defaultClass) {
@@ -82,13 +114,12 @@ export const registerUser = async (req, res) => {
 
       const student = await Student.create({
         user: user._id,
-        rollNo: rollNo,
+        rollNo,
         class: defaultClass._id,
         grade: defaultClass.grade,
-        status: 'Active'
+        status: 'Active',
       });
 
-      // Create default Tuition Fee
       await Fee.create({
         student: student._id,
         class: defaultClass._id,
@@ -96,24 +127,24 @@ export const registerUser = async (req, res) => {
         amountPaid: 0,
         feeType: 'Tuition',
         status: 'Pending',
-        dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
+        dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
         academicYear: new Date().getFullYear().toString(),
       });
     }
 
-    if (user) {
-      res.status(201).json({
+    return res.status(201).json({
+      success: true,
+      message: 'Registration successful',
+      data: {
         _id: user._id,
         name: user.name,
         email: user.email,
         role: user.role,
         avatar: user.avatar,
         token: generateToken(user._id, user.role),
-      });
-    } else {
-      res.status(400).json({ message: 'Invalid user data' });
-    }
+      },
+    });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };

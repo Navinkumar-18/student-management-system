@@ -2,24 +2,75 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import connectDB from './config/db.js';
+import morgan from 'morgan';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import logger from './utils/logger.js';
+import { errorHandler, notFound } from './middleware/errorMiddleware.js';
 
 dotenv.config();
 
-const app = express();
+// ── Environment Validation ──
+const requiredEnvVars = ['MONGO_URI', 'JWT_SECRET'];
+const missingVars = requiredEnvVars.filter((key) => !process.env[key]);
+if (missingVars.length > 0) {
+  logger.error(`Missing required environment variables: ${missingVars.join(', ')}`);
+  process.exit(1);
+}
 
-import path from 'path';
-import { fileURLToPath } from 'url';
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'your_jwt_secret_key_change_in_production') {
+  logger.error('JWT_SECRET must be changed from the default value in production');
+  if (process.env.NODE_ENV === 'production') process.exit(1);
+}
 
-// Fix __dirname for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+const app = express();
+
+// ── Security Middleware ──
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+
+// ── General Rate Limiting ──
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api', generalLimiter);
+
+// ── Auth Rate Limiting ──
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { success: false, message: 'Too many login attempts, please try again after 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ── Logging ──
+app.use(morgan('dev'));
+app.use((req, res, next) => {
+  const originalSend = res.json.bind(res);
+  res.json = function (body) {
+    if (res.statusCode >= 400) {
+      logger.warn(`${req.method} ${req.originalUrl} ${res.statusCode}`, body);
+    }
+    return originalSend(body);
+  };
+  next();
+});
+
+// ── Middleware ──
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+app.use(express.json({ limit: '10mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Routes
+// ── Routes ──
 import authRoutes from './routes/authRoutes.js';
 import studentRoutes from './routes/studentRoutes.js';
 import teacherRoutes from './routes/teacherRoutes.js';
@@ -30,7 +81,7 @@ import leaveRoutes from './routes/leaveRoutes.js';
 import markRoutes from './routes/markRoutes.js';
 import statsRoutes from './routes/statsRoutes.js';
 
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/students', studentRoutes);
 app.use('/api/teachers', teacherRoutes);
 app.use('/api/attendance', attendanceRoutes);
@@ -40,42 +91,31 @@ app.use('/api/leaves', leaveRoutes);
 app.use('/api/marks', markRoutes);
 app.use('/api/stats', statsRoutes);
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Student Management System API is running' });
+// ── Health Check ──
+app.get('/api/health', async (req, res) => {
+  const mongoose = (await import('mongoose')).default;
+  const dbState = mongoose.connection.readyState;
+  const dbStatus = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+  res.json({
+    success: true,
+    message: 'Student Management System API is running',
+    data: {
+      uptime: process.uptime(),
+      dbStatus: dbStatus[dbState] || 'unknown',
+      timestamp: new Date().toISOString(),
+    },
+  });
 });
 
-import Student from './models/Student.js';
-import Fee from './models/Fee.js';
+// ── Error Handling ──
+app.use(notFound);
+app.use(errorHandler);
 
-async function seedMissingFees() {
-  try {
-    const students = await Student.find({});
-    for (const student of students) {
-      const feeCount = await Fee.countDocuments({ student: student._id });
-      if (feeCount === 0) {
-        console.log(`Allotted default tuition fee for existing student rollNo: ${student.rollNo}`);
-        await Fee.create({
-          student: student._id,
-          class: student.class,
-          amount: 50000,
-          amountPaid: 0,
-          feeType: 'Tuition',
-          status: 'Pending',
-          dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
-          academicYear: new Date().getFullYear().toString(),
-        });
-      }
-    }
-  } catch (err) {
-    console.error('Error seeding missing fees:', err);
-  }
-}
-
+// ── Start Server ──
 const PORT = process.env.PORT || 5000;
 
-connectDB().then(async () => {
-  await seedMissingFees();
+connectDB().then(() => {
   app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    logger.info(`Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
   });
 });

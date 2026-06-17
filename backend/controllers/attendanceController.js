@@ -1,111 +1,128 @@
 import Attendance from '../models/Attendance.js';
 import Student from '../models/Student.js';
+import Teacher from '../models/Teacher.js';
 import Class from '../models/Class.js';
 import User from '../models/User.js';
+import { sendSuccess, sendError } from '../utils/response.js';
+import AppError from '../utils/AppError.js';
 
-export const getAttendance = async (req, res) => {
+export const getAttendance = async (req, res, next) => {
   const { date, className, studentEmail } = req.query;
 
   try {
     if (studentEmail) {
-      // Fetch attendance for a specific student by email
       const user = await User.findOne({ email: studentEmail });
       if (!user) {
-        return res.status(404).json({ message: 'User not found' });
+        return sendError(res, 'User not found', 404);
       }
       const student = await Student.findOne({ user: user._id });
       if (!student) {
-        return res.status(404).json({ message: 'Student profile not found' });
+        return sendError(res, 'Student profile not found', 404);
       }
 
       const records = await Attendance.find({ student: student._id })
         .populate('class')
         .sort({ date: -1 });
 
-      const formatted = records.map(r => ({
+      const formatted = records.map((r) => ({
         id: r._id,
         date: new Date(r.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
         rawDate: new Date(r.date).toISOString().split('T')[0],
         status: r.status,
         time: r.time || '-',
-        className: r.class ? `${r.class.name}-${r.class.section}` : ''
+        className: r.class ? `${r.class.name}-${r.class.section}` : '',
       }));
 
-      return res.json(formatted);
+      return sendSuccess(res, formatted);
     }
 
-    // Otherwise, fetch class-wise attendance for a specific date
+    let targetClassId = null;
+
+    if (req.user.role === 'teacher') {
+      const teacher = await Teacher.findOne({ user: req.user._id });
+      if (teacher && teacher.classTeacherOf) {
+        targetClassId = teacher.classTeacherOf;
+      }
+    } else {
+      const gradeParts = (className || '10-A').split('-');
+      const clsName = gradeParts[0] || '10';
+      const clsSec = gradeParts[1] || 'A';
+      const studentClass = await Class.findOne({ name: clsName, section: clsSec });
+      if (studentClass) {
+        targetClassId = studentClass._id;
+      }
+    }
+
+    if (!targetClassId) {
+      return sendSuccess(res, []);
+    }
+
     const targetDate = date ? new Date(date) : new Date();
     targetDate.setUTCHours(0, 0, 0, 0);
 
-    // Let's get the class
-    const gradeParts = (className || '10-A').split('-');
-    const clsName = gradeParts[0] || '10';
-    const clsSec = gradeParts[1] || 'A';
-    const studentClass = await Class.findOne({ name: clsName, section: clsSec });
+    const students = await Student.find({ class: targetClassId }).populate('user');
 
-    if (!studentClass) {
-      return res.json([]);
-    }
-
-    // Fetch all students in this class
-    const students = await Student.find({ class: studentClass._id }).populate('user');
-
-    // Fetch existing attendance records for this date and class
     const endOfDay = new Date(targetDate);
     endOfDay.setUTCHours(23, 59, 59, 999);
     const existingRecords = await Attendance.find({
-      class: studentClass._id,
-      date: { $gte: targetDate, $lte: endOfDay }
+      class: targetClassId,
+      date: { $gte: targetDate, $lte: endOfDay },
     });
 
     const recordsMap = new Map();
-    existingRecords.forEach(r => recordsMap.set(r.student.toString(), r));
+    existingRecords.forEach((r) => recordsMap.set(r.student.toString(), r));
 
-    // Combine
-    const attendanceData = students.map(student => {
+    const attendanceData = students.map((student) => {
       const record = recordsMap.get(student._id.toString());
       return {
         id: student._id,
         name: student.user?.name || 'Unknown',
         rollNo: student.rollNo,
-        status: record ? record.status : 'Present', // Default to Present if not marked
+        status: record ? record.status : 'Present',
         time: record ? record.time : '8:00 AM',
         date: targetDate.toISOString().split('T')[0],
-        recordId: record ? record._id : null
+        recordId: record ? record._id : null,
       };
     });
 
-    res.json(attendanceData);
+    return sendSuccess(res, attendanceData);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error fetching attendance', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
 
-export const saveAttendance = async (req, res) => {
-  const { date, className, records } = req.body; // records is array of { studentId, status, time }
+export const saveAttendance = async (req, res, next) => {
+  const { date, className, records } = req.body;
 
   try {
     const targetDate = date ? new Date(date) : new Date();
     targetDate.setUTCHours(0, 0, 0, 0);
 
-    const gradeParts = (className || '10-A').split('-');
-    const clsName = gradeParts[0] || '10';
-    const clsSec = gradeParts[1] || 'A';
-    let studentClass = await Class.findOne({ name: clsName, section: clsSec });
+    let classId;
+    if (req.user.role === 'teacher') {
+      const teacher = await Teacher.findOne({ user: req.user._id });
+      if (!teacher || !teacher.classTeacherOf) {
+        return sendError(res, 'You are not assigned to any class', 403);
+      }
+      classId = teacher.classTeacherOf;
+    } else {
+      const gradeParts = (className || '10-A').split('-');
+      const clsName = gradeParts[0] || '10';
+      const clsSec = gradeParts[1] || 'A';
+      const studentClass = await Class.findOne({ name: clsName, section: clsSec });
+      classId = studentClass ? studentClass._id : null;
+    }
 
-    if (!studentClass) {
-      studentClass = await Class.create({ name: clsName, section: clsSec, grade: clsName });
+    if (!classId) {
+      return sendError(res, 'Class not found', 404);
     }
 
     const savedRecords = [];
 
     for (const rec of records) {
-      // Find or update
       let attendanceRecord = await Attendance.findOne({
         student: rec.studentId,
-        date: targetDate
+        date: targetDate,
       });
 
       if (attendanceRecord) {
@@ -115,18 +132,17 @@ export const saveAttendance = async (req, res) => {
       } else {
         attendanceRecord = await Attendance.create({
           student: rec.studentId,
-          class: studentClass._id,
+          class: classId,
           date: targetDate,
           status: rec.status,
-          time: rec.time || '8:00 AM'
+          time: rec.time || '8:00 AM',
         });
       }
       savedRecords.push(attendanceRecord);
     }
 
-    res.json({ message: 'Attendance saved successfully', count: savedRecords.length });
+    return sendSuccess(res, { count: savedRecords.length }, 'Attendance saved successfully');
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: 'Server Error saving attendance', error: error.message });
+    next(new AppError(error.message, 500));
   }
 };
